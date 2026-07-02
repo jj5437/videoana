@@ -143,6 +143,9 @@ class TreatmentPlan:
     frame_perturbation_intensity: float | None = None
     audio_evasion_intensity: float | None = None
     hash_evasion_intensity: float | None = None
+    codec: str = "libx264"
+    min_bitrate: str | None = None
+    target_bitrate: str | None = None
 
 
 def validate_requested_modes(modes: list[str]) -> None:
@@ -1306,12 +1309,37 @@ def build_ffmpeg_command(plan: TreatmentPlan, *, validate_paths: bool = True) ->
         audio_chain = ",".join(audio_filters)
         cmd.extend(["-af", audio_chain])
 
-    # Video codec
-    cmd.extend(["-c:v", "libx264", "-preset", plan.preset])
-    cmd.extend(["-crf", str(effective_crf)])
+    # Video codec: ABR mode if target_bitrate is set, otherwise CRF
+    cmd.extend(["-c:v", plan.codec, "-preset", plan.preset])
+    if plan.target_bitrate:
+        cmd.extend(["-b:v", plan.target_bitrate])
+        # Derive maxrate/bufsize as 1.5x target (e.g. 4M -> 6M)
+        maxrate = plan.target_bitrate
+        if maxrate.lower().endswith("k"):
+            maxrate_val = int(int(maxrate[:-1]) * 1.5)
+            maxrate = f"{maxrate_val}k"
+        elif maxrate.lower().endswith("m"):
+            maxrate_val = int(int(maxrate[:-1]) * 1.5)
+            maxrate = f"{maxrate_val}M"
+        cmd.extend(["-minrate", plan.target_bitrate])
+        cmd.extend(["-maxrate", maxrate])
+        cmd.extend(["-bufsize", maxrate])
+    else:
+        cmd.extend(["-crf", str(effective_crf)])
+        if plan.min_bitrate:
+            cmd.extend(["-minrate", plan.min_bitrate])
+            maxrate = plan.min_bitrate
+            if maxrate.lower().endswith("k"):
+                maxrate_val = int(maxrate[:-1]) * 2
+                maxrate = f"{maxrate_val}k"
+            elif maxrate.lower().endswith("m"):
+                maxrate_val = int(maxrate[:-1]) * 2
+                maxrate = f"{maxrate_val}M"
+            cmd.extend(["-maxrate", maxrate])
+            cmd.extend(["-bufsize", maxrate])
 
-    # x264 params for hash evasion
-    if hash_params and hash_params.get("x264_params"):
+    # x264/x265 params for hash evasion
+    if hash_params and hash_params.get("x264_params") and plan.codec == "libx264":
         cmd.extend(["-x264-params", hash_params["x264_params"]])
 
     cmd.extend(["-pix_fmt", "yuv420p"])
@@ -1385,6 +1413,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, help="可选输出帧率")
     parser.add_argument("--duration", type=float, help="只处理前 N 秒，便于快速 smoke test")
     parser.add_argument("--fontfile", type=Path, help="可选字体文件，中文字幕建议指定可用中文字体")
+    parser.add_argument("--codec", default="libx264", choices=["libx264", "libx265"], help="视频编码器，默认 libx264；libx265 体积更小但兼容性略差")
+    parser.add_argument("--min-bitrate", default=None, help="最低视频码率（CRF 模式下），例如 4M")
+    parser.add_argument("--target-bitrate", default=None, help="目标平均视频码率，例如 4M；设置后改用 ABR 模式，强制每集平均码率接近此值")
     parser.add_argument("--caption-total-seconds", type=float, help="字幕铺满的目标时长；默认使用输出时长或输入视频时长")
     parser.add_argument("--subtitle-band-y-ratio", type=float, default=0.61, help="字幕遮挡区起始位置占画布高度比例")
     parser.add_argument("--subtitle-band-height-ratio", type=float, default=0.15, help="字幕遮挡区高度占画布高度比例")
@@ -1531,6 +1562,9 @@ def main() -> int:
         frame_perturbation_intensity=args.frame_perturbation_intensity,
         audio_evasion_intensity=args.audio_evasion_intensity,
         hash_evasion_intensity=args.hash_evasion_intensity,
+        codec=args.codec,
+        min_bitrate=args.min_bitrate,
+        target_bitrate=args.target_bitrate,
     )
 
     # Log active deep processing modes
@@ -1553,11 +1587,10 @@ def main() -> int:
         rng = random.Random(plan.seed)
         evaded = apply_container_evasion(plan.output, plan, rng)
         if evaded and evaded != plan.output:
-            # Replace original with evaded version
-            backup = plan.output.with_suffix(plan.output.suffix + ".pre-evasion")
-            plan.output.rename(backup)
+            # Replace original with evaded version, remove intermediate backup
+            plan.output.unlink()
             evaded.rename(plan.output)
-            print(f"[container-evasion] applied ({evaded.suffix} → final output; backup at {backup})")
+            print(f"[container-evasion] applied (intermediate removed)")
 
     return 0
 
